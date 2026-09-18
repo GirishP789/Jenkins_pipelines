@@ -1,8 +1,7 @@
-# Jenkins_pipelines
-Jenkins pipes repo
+# LKP_all_os_vm
 
-branchs
-LKP_all_os_vm : this pipe is for LKP test with 6 different OS + extra OS feature
-LKP_rpm_in_vm - pipe that as rpm install in vm
-Elves_validation
-Elves_regression
+This pipe is for LKP test with 6 different OS + extra OS feature.
+
+## Pipeline
+
+- `lkp_reg.groovy`
