@@ -1,15 +1,17 @@
 import groovy.transform.Field
 
 /**
- * Root of the LKP result archive on the SUT. Must already exist on the agent — the
- * pipeline fails fast instead of creating it, so a typo here can never scatter result
- * trees over the filesystem. Per-build layout created below it:
+ * LKP result archive: kept inside the Jenkins job workspace on the SUT (env.WORKSPACE), so it
+ * can be browsed and downloaded from the build's "Workspace" page. Per-build layout (see
+ * prepareRunBackupDir):
  *
- *   <PIPELINE_DATA_DIR>/<JOB_NAME, spaces->_>/Run_<BUILD_NUMBER>/<RUN_NAME>/
+ *   <WORKSPACE>/Run_<BUILD_NUMBER>/<RUN_NAME>/lkp_result/
+ *   <WORKSPACE>/Run_<BUILD_NUMBER>/DEAE_<JIRA_ID>_<OS>_<kernel>_<pipe>.xlsx
+ *     (copy of the /home/amd workbook, refreshed after every LKP run)
+ *   e.g. /tests/jenkins/workspace/workspace/<job folder path>/<job name>/Run_3/BASE_ONLY_LKP/lkp_result
  *
  * where RUN_NAME is BASE_ONLY_LKP / BASE_VM / BASE_VM_LKP / PATCH_ONLY_LKP / … .
  */
-@Field String PIPELINE_DATA_DIR = '/tests/jenkins/workspace/'
 
 /**
  * How long the GRUB menu stays on screen, IN SECONDS, before the default kernel is booted.
@@ -255,7 +257,7 @@ pipeline {
         booleanParam(
             name: 'PREREQUISITES_CONFIRMED',
             defaultValue: false,
-            description: '''BEFORE YOU RUN — confirm these one-time prerequisites on the SUT/agent (NODE_LABEL). The build fails fast in "Validate parameters" if any are missing.
+            description: '''BEFORE YOU RUN — confirm these one-time prerequisites on the SUT/agent (NODE_LABEL) and tick this box. The build fails in "Validate parameters" if this box is not ticked or if any of these are missing.
 
 1) 12 golden VM qcow2 images must be in  /vms/jenkins_qcow2/*  (6 no-LKP + 6 LKP; one per OS: anolis/Rocky/Opencloud/Euler/Velinux/Ubuntu). If missing, copy them from the development host and fix ownership:
        scp amd@10.86.26.102:/home/amd/vol1/images/jenkins/*  /vms/jenkins_qcow2/
@@ -264,7 +266,7 @@ pipeline {
 2) LKP result Excel template must be at  /vms/jenkins_excel_template/lkp_result_template.xlsx  (see LKP_RESULT_TEMPLATE_PATH below). If missing, copy it from the development host:
        scp amd@10.86.26.102:/home/amd/vol1/images/jenkins_excel_template/lkp_result_template.xlsx  /vms/jenkins_excel_template/
 
-3) The result-archive root path /tests/jenkins/workspace/ must exist and be writable by the agent user (per-build subdirectories under it are created automatically from JOB_NAME).'''
+3) The Jenkins agent's remote root directory (e.g. /tests/jenkins/workspace) must be on a disk with enough space: LKP results and a copy of the Excel workbook are saved in the job workspace under Run_<BUILD_NUMBER>/ and can be downloaded from the build's Workspace page.'''
         )
         string(
             name: 'NODE_LABEL',
@@ -282,7 +284,7 @@ pipeline {
             name: 'LKP_RESULT_TEMPLATE_PATH',
             defaultValue: '/vms/jenkins_excel_template/lkp_result_template.xlsx',
             trim: true,
-            description: 'Path (on the agent) to the LKP result Excel template. Copied to /home/amd/DEAE_<JIRA_ID>/ on first use, then edited in place.'
+            description: 'Path (on the agent) to the LKP result Excel template. Copied to /home/amd/DEAE_<JIRA_ID>/ on first use, then edited in place (a copy is also saved in the workspace under Run_<BUILD_NUMBER>/).'
         )
         choice(
             name: 'RPM_KERNEL_BUILD',
@@ -436,10 +438,30 @@ ALL — all three.'''
     stages {
 
         stage('Resolve node IP from agent') {
-            agent { label params.NODE_LABEL }
+            agent none
             steps {
                 script {
-                    resolveNodeIpFromAgent()
+                    // Fail fast when no online agent carries NODE_LABEL, instead of queueing forever.
+                    // node('') would run on any agent, so an empty label is rejected up front.
+                    if (!params.NODE_LABEL?.trim()) {
+                        error('NODE_LABEL must not be empty.')
+                    }
+                    boolean gotAgent = false
+                    try {
+                        timeout(time: 1, unit: 'MINUTES') {
+                            node(params.NODE_LABEL) {
+                                gotAgent = true
+                                env.AGENT_REACHED = 'true'
+                                resolveNodeIpFromAgent()
+                            }
+                        }
+                    } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                        if (gotAgent) {
+                            throw e
+                        }
+                        error("No online Jenkins agent with label '${params.NODE_LABEL}' within 1 minute. " +
+                            'Check NODE_LABEL and that the agent is connected (Manage Jenkins > Nodes), then re-run.')
+                    }
                 }
             }
         }
@@ -447,6 +469,7 @@ ALL — all three.'''
         stage('Show LKP-running banner (motd)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { params.RPM_KERNEL_BUILD != 'NULL_NO_KERNEL_WORKFLOW' }
             }
             steps {
@@ -463,6 +486,7 @@ ALL — all three.'''
         stage('Validate parameters') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { params.RPM_KERNEL_BUILD != 'NULL_NO_KERNEL_WORKFLOW' }
             }
             steps {
@@ -475,6 +499,7 @@ ALL — all three.'''
         stage('Prepare result backup dir') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { params.RPM_KERNEL_BUILD != 'NULL_NO_KERNEL_WORKFLOW' }
             }
             steps {
@@ -488,6 +513,7 @@ ALL — all three.'''
         stage('Detect OS / boot method') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { params.RPM_KERNEL_BUILD != 'NULL_NO_KERNEL_WORKFLOW' }
             }
             steps {
@@ -501,6 +527,7 @@ ALL — all three.'''
         stage('Install prerequisites') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { params.RPM_KERNEL_BUILD != 'NULL_NO_KERNEL_WORKFLOW' }
             }
             steps {
@@ -513,6 +540,7 @@ ALL — all three.'''
         stage('NULL_NO_KERNEL_WORKFLOW (no-op)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { params.RPM_KERNEL_BUILD == 'NULL_NO_KERNEL_WORKFLOW' }
             }
             steps {
@@ -523,6 +551,7 @@ ALL — all three.'''
         stage('Checkout kernel repo') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsKernelRepo() }
             }
             steps {
@@ -545,6 +574,7 @@ ALL — all three.'''
         stage('Get Default Kernel') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { params.RPM_KERNEL_BUILD != 'NULL_NO_KERNEL_WORKFLOW' }
             }
             steps {
@@ -557,6 +587,7 @@ ALL — all three.'''
         stage('Build With Patch Kernel') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression {
                     params.RPM_KERNEL_BUILD == 'BUILD_BOTH'
                 }
@@ -574,6 +605,7 @@ ALL — all three.'''
         stage('Build Base Kernel') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression {
                     params.RPM_KERNEL_BUILD == 'BUILD_BOTH'
                 }
@@ -650,6 +682,7 @@ ALL — all three.'''
         stage('Resolve PATCH_KERNEL and BASE_KERNEL') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { params.RPM_KERNEL_BUILD != 'NULL_NO_KERNEL_WORKFLOW' }
             }
             steps {
@@ -662,6 +695,7 @@ ALL — all three.'''
         stage('Set default kernel (BASE)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothBasePatchLkp() && !shouldSkipBoot('BASE') }
             }
             steps {
@@ -687,6 +721,7 @@ ALL — all three.'''
         stage('Verify kernel (BASE)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothBasePatchLkp() }
             }
             steps {
@@ -699,6 +734,7 @@ ALL — all three.'''
         stage('LKP on BASE kernel') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothBasePatchLkp() }
             }
             steps {
@@ -711,6 +747,7 @@ ALL — all three.'''
         stage('Set default kernel (PATCH)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothBasePatchLkp() && !shouldSkipBoot('PATCH') }
             }
             steps {
@@ -736,6 +773,7 @@ ALL — all three.'''
         stage('Verify kernel (PATCH)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothBasePatchLkp() }
             }
             steps {
@@ -748,6 +786,7 @@ ALL — all three.'''
         stage('LKP on PATCH kernel') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothBasePatchLkp() }
             }
             steps {
@@ -760,6 +799,7 @@ ALL — all three.'''
         stage('Set default kernel (boot target)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression {
                     needsBootTargetWorkflow() && bootTargetKernelRole() && !shouldSkipBoot(bootTargetKernelRole())
                 }
@@ -788,6 +828,7 @@ ALL — all three.'''
         stage('Verify kernel after boot') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBootTargetWorkflow() && bootTargetKernelRole() }
             }
             steps {
@@ -800,6 +841,7 @@ ALL — all three.'''
         stage('LKP after boot') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsLkpAfterBoot() }
             }
             steps {
@@ -812,6 +854,7 @@ ALL — all three.'''
         stage('Single-kernel VM run: create -> LKP -> delete') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsSingleKernelVmWorkflow() }
             }
             steps {
@@ -825,6 +868,7 @@ ALL — all three.'''
         stage('BOTH_VM: Set default kernel (BASE)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothKernelVmWorkflow() && !shouldSkipBoot('BASE') }
             }
             steps {
@@ -850,6 +894,7 @@ ALL — all three.'''
         stage('BOTH_VM: Verify kernel (BASE)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothKernelVmWorkflow() }
             }
             steps {
@@ -862,6 +907,7 @@ ALL — all three.'''
         stage('BOTH_VM: VM run on BASE kernel (create -> LKP -> delete)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothKernelVmWorkflow() }
             }
             steps {
@@ -879,6 +925,7 @@ ALL — all three.'''
         stage('BOTH_VM: Set default kernel (PATCH)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothKernelVmWorkflow() && !shouldSkipBoot('PATCH') }
             }
             steps {
@@ -904,6 +951,7 @@ ALL — all three.'''
         stage('BOTH_VM: Verify kernel (PATCH)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothKernelVmWorkflow() }
             }
             steps {
@@ -916,6 +964,7 @@ ALL — all three.'''
         stage('BOTH_VM: VM run on PATCH kernel (create -> LKP -> delete)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsBothKernelVmWorkflow() }
             }
             steps {
@@ -929,6 +978,7 @@ ALL — all three.'''
         stage('ALL: Set default kernel (BASE)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsAllSequenceBase() && !shouldSkipBoot('BASE') }
             }
             steps {
@@ -954,6 +1004,7 @@ ALL — all three.'''
         stage('ALL: Verify kernel (BASE)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsAllSequenceBase() }
             }
             steps {
@@ -966,6 +1017,7 @@ ALL — all three.'''
         stage('Host with base kernel') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsAllSequenceBase() }
             }
             steps {
@@ -978,6 +1030,7 @@ ALL — all three.'''
         stage('Host + Guests with base kernel [ LKP only on Host ]') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsAllSequenceBase() }
             }
             steps {
@@ -990,6 +1043,7 @@ ALL — all three.'''
         stage('Host + Guests with base kernel [ LKP on both Host & Guests ]') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsAllSequenceBase() }
             }
             steps {
@@ -1002,6 +1056,7 @@ ALL — all three.'''
         stage('ALL: Set default kernel (PATCH)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsAllSequencePatch() && !shouldSkipBoot('PATCH') }
             }
             steps {
@@ -1028,6 +1083,7 @@ ALL — all three.'''
         stage('ALL: Verify kernel (PATCH)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsAllSequencePatch() }
             }
             steps {
@@ -1040,6 +1096,7 @@ ALL — all three.'''
         stage('Host with patched kernel') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsAllSequencePatch() }
             }
             steps {
@@ -1052,6 +1109,7 @@ ALL — all three.'''
         stage('Host + Guests with patched kernel [ LKP only on Host ]') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsAllSequencePatch() }
             }
             steps {
@@ -1064,6 +1122,7 @@ ALL — all three.'''
         stage('Host + Guests with patched kernel [ LKP on both Host & Guests ]') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { needsAllSequencePatch() }
             }
             steps {
@@ -1076,6 +1135,7 @@ ALL — all three.'''
         stage('Remove LKP-running banner (motd)') {
             agent { label params.NODE_LABEL }
             when {
+                beforeAgent true
                 expression { params.RPM_KERNEL_BUILD != 'NULL_NO_KERNEL_WORKFLOW' }
             }
             steps {
@@ -1092,6 +1152,10 @@ ALL — all three.'''
             script {
                 if (params.RPM_KERNEL_BUILD == 'NULL_NO_KERNEL_WORKFLOW') {
                     echo 'NULL_NO_KERNEL_WORKFLOW: nothing was created; skipping post-build VM status check and cleanup.'
+                    return
+                }
+                if (env.AGENT_REACHED != 'true') {
+                    echo "Agent '${params.NODE_LABEL}' was never reached; nothing ran on it, skipping post-build cleanup."
                     return
                 }
                 // A build that failed because the SUT never came back would otherwise wait
@@ -1156,7 +1220,7 @@ ALL — all three.'''
         }
         aborted {
             script {
-                if (params.RPM_KERNEL_BUILD == 'NULL_NO_KERNEL_WORKFLOW') {
+                if (params.RPM_KERNEL_BUILD == 'NULL_NO_KERNEL_WORKFLOW' || env.AGENT_REACHED != 'true') {
                     return
                 }
                 try {
@@ -1293,9 +1357,18 @@ def validateBaseHeadShaIdParam() {
 }
 
 def validateRpmKernelParams() {
+    if (!params.PREREQUISITES_CONFIRMED) {
+        error('PREREQUISITES_CONFIRMED is not ticked. Check the one-time prerequisites listed in its description ' +
+            '(golden qcow2 images, Excel template, agent workspace disk), tick the box and re-run.')
+    }
     if (!params.JIRA_ID?.trim()) {
         error('JIRA_ID is required: it names the result directory /home/amd/DEAE_<JIRA_ID> and the LKP result workbook. Provide the Jira ticket number and re-run.')
     }
+    // Every non-NULL run ends in an LKP report; check the template now, not after hours of LKP.
+    if (!params.LKP_RESULT_TEMPLATE_PATH?.trim()) {
+        error('LKP_RESULT_TEMPLATE_PATH is empty; set it to the LKP result Excel template on the agent.')
+    }
+    requireAgentPathExists(params.LKP_RESULT_TEMPLATE_PATH.trim(), 'LKP_RESULT_TEMPLATE_PATH', false)
 
     if (params.RPM_KERNEL_BUILD == 'BUILD_BOTH') {
         // BASE_HEAD_SHA_ID is only consumed by the Build Base Kernel stage, which only
@@ -1310,6 +1383,9 @@ def validateRpmKernelParams() {
         }
         requireAgentPathExists(params.EXISTING_REPO_PATH.trim(), 'EXISTING_REPO_PATH', true)
         requirePresetGitCheckoutOnAgent(params.EXISTING_REPO_PATH.trim())
+        if (params.CHOOSE_BUILD_CONFIG == 'others' && !params.CUSTOM_CONFIG?.trim()) {
+            error("CHOOSE_BUILD_CONFIG=others requires CUSTOM_CONFIG (a make config target, e.g. x86_64_defconfig).")
+        }
     }
 
     switch (params.RPM_KERNEL_BUILD) {
@@ -1468,28 +1544,19 @@ Map lkpContext(String lkpReportContext) {
 }
 
 /**
- * Create <PIPELINE_DATA_DIR>/<JOB_NAME>/Run_<BUILD_NUMBER> once per build and publish it as
- * env.RUN_BACKUP_DIR for every later LKP backup. The job's folder path + name comes from
- * env.JOB_NAME (the Jenkins folder tree, spaces replaced by '_'). The archive ROOT must
- * already exist (fails fast if not); only the per-build subdirs under it are created here.
+ * Create <WORKSPACE>/Run_<BUILD_NUMBER> once per build and publish it as env.RUN_BACKUP_DIR for
+ * every later LKP backup and workbook copy. The workspace path can contain spaces (Jenkins
+ * folder names), so every shell use of it must stay quoted.
  */
 def prepareRunBackupDir() {
-    String root = PIPELINE_DATA_DIR.endsWith('/') ? PIPELINE_DATA_DIR : "${PIPELINE_DATA_DIR}/"
-    // Jenkins job folder path + name; spaces -> '_' so the on-disk path has no spaces.
-    String jobPath = (env.JOB_NAME ?: env.JOB_BASE_NAME ?: 'lkp').trim().replace(' ', '_')
-    String target = "${root}${jobPath}/Run_${env.BUILD_NUMBER}"
-    withEnv(["_DATA_ROOT=${root}", "_BUILD_DIR=${target}"]) {
+    String ws = env.WORKSPACE?.trim()
+    if (!ws) {
+        error('WORKSPACE is not set: prepareRunBackupDir() must run inside a stage with an agent.')
+    }
+    String target = "${ws}/Run_${env.BUILD_NUMBER}"
+    withEnv(["_BUILD_DIR=${target}"]) {
         sh '''
         set -eu
-        # The archive ROOT must already exist (it is normally a dedicated mount). Fail here
-        # rather than let `mkdir -p` scatter a stray tree onto the agent's local disk.
-        if [ ! -d "${_DATA_ROOT}" ]; then
-            echo "Result-archive root does not exist on this agent: ${_DATA_ROOT}" >&2
-            echo "Create it (or fix PIPELINE_DATA_DIR at the top of the pipeline) and re-run." >&2
-            exit 1
-        fi
-        # Per-build subdirs are created under the existing root; -p also avoids a race when
-        # two jobs share the root. Results land under the Jenkins job's own folder path.
         mkdir -p "${_BUILD_DIR}"
         echo "LKP result backups for this build: ${_BUILD_DIR}"
         '''
@@ -1963,7 +2030,8 @@ def setDefaultKernelGrubDebian(String kernelRelease) {
                 fi
 
         SUBMENU=$(grep -E "submenu '.*Advanced options" "$GRUB_CFG" | head -1 | sed -n "s/.*submenu '\\([^']*\\)'.*/\\1/p")
-        ENTRY=$(grep -F "with Linux ${_K}" "$GRUB_CFG" | grep menuentry | head -1 | sed -n "s/.*menuentry '\\([^']*\\)'.*/\\1/p")
+        # The closing quote pins the exact release: "with Linux 6.1.6" would also match 6.1.61.
+        ENTRY=$(grep -F "with Linux ${_K}'" "$GRUB_CFG" | grep menuentry | head -1 | sed -n "s/.*menuentry '\\([^']*\\)'.*/\\1/p")
         if [ -z "$ENTRY" ]; then
             echo "ERROR: no menuentry for kernel ${_K} in $GRUB_CFG" >&2
             exit 1
@@ -2083,7 +2151,7 @@ def prepareBootArtifacts(String kernelRelease) {
         if ! command -v grubby >/dev/null 2>&1; then
             GRUB_CFG=/boot/grub/grub.cfg
             [ -f "${GRUB_CFG}" ] || GRUB_CFG=/boot/grub2/grub.cfg
-            if [ -f "${GRUB_CFG}" ] && ! grep -qF "with Linux ${_K}" "${GRUB_CFG}"; then
+            if [ -f "${GRUB_CFG}" ] && ! grep -qF "with Linux ${_K}'" "${GRUB_CFG}"; then
                 echo "No menu entry for ${_K} in ${GRUB_CFG}; regenerating the menu."
                 if command -v update-grub >/dev/null 2>&1; then
                     update-grub
@@ -2196,10 +2264,13 @@ def preflightBootChecks(String kernelRelease) {
             GRUB_CFG=/boot/grub/grub.cfg
             [ -f "${GRUB_CFG}" ] || GRUB_CFG=/boot/grub2/grub.cfg
 
-            if ! grep -qF "with Linux ${_K}" "${GRUB_CFG}"; then
+            # Exact-release matches: a bare substring would let 6.1.6 pass on 6.1.61's entry.
+            # K_RE is _K with regex metacharacters (. + etc.) escaped, for grep -E.
+            K_RE=$(printf '%s' "${_K}" | sed 's/[][\\.*^$+?(){}|]/\\\\&/g')
+            if ! grep -qF "with Linux ${_K}'" "${GRUB_CFG}"; then
                 red "no menuentry for ${_K} in ${GRUB_CFG} (fix: update-grub)."
             fi
-            if ! grep -qF "initrd.img-${_K}" "${GRUB_CFG}"; then
+            if ! grep -qE "initrd\\.img-${K_RE}([[:space:]]|$)" "${GRUB_CFG}"; then
                 red "no initrd line for ${_K} in ${GRUB_CFG} — the entry would boot without an initramfs."
             fi
             # Not a red flag: setDefaultKernelGrubDebian sets this immediately after, and
@@ -2208,11 +2279,11 @@ def preflightBootChecks(String kernelRelease) {
                 echo "NOTE: GRUB_DEFAULT is not yet 'saved' in /etc/default/grub; the boot selection step sets it."
             fi
 
-            NEW_ARGS=$(grep -F "vmlinuz-${_K}" "${GRUB_CFG}" | grep -E '^[[:space:]]*linux' | head -1 || true)
+            NEW_ARGS=$(grep -E "vmlinuz-${K_RE}([[:space:]]|$)" "${GRUB_CFG}" | grep -E '^[[:space:]]*linux' | head -1 || true)
             NEW_ROOT=$(printf '%s' "${NEW_ARGS}" | tr ' ' '\\n' | sed -n 's/^root=//p' | head -1)
 
             RUN_ENTRY_OK=1
-            grep -qF "with Linux $(uname -r)" "${GRUB_CFG}" || RUN_ENTRY_OK=0
+            grep -qF "with Linux $(uname -r)'" "${GRUB_CFG}" || RUN_ENTRY_OK=0
         else
             ENTRY=$(grubby --info="${IMG}" 2>/dev/null || true)
             if [ -z "${ENTRY}" ]; then
@@ -2293,6 +2364,22 @@ def verifyBootSelection(String kernelRelease) {
         # so verify next_entry rather than the default here. If it is not set the code fell back
         # to the persistent default, so drop through to the default check below. The booted
         # kernel is confirmed authoritatively after the reboot by verifyRunningKernel.
+        # Recompute the exact selection the set-default step made for ${_K}, so next_entry /
+        # saved_entry are compared for equality rather than "contains ${_K}" (6.1.6 vs 6.1.61).
+        if [ "${_M}" = grub_debian ]; then
+            GRUB_CFG=/boot/grub/grub.cfg
+            [ -f "$GRUB_CFG" ] || GRUB_CFG=/boot/grub2/grub.cfg
+            SUBMENU=$(grep -E "submenu '.*Advanced options" "$GRUB_CFG" 2>/dev/null | head -1 | sed -n "s/.*submenu '\\([^']*\\)'.*/\\1/p")
+            ENTRY=$(grep -F "with Linux ${_K}'" "$GRUB_CFG" 2>/dev/null | grep menuentry | head -1 | sed -n "s/.*menuentry '\\([^']*\\)'.*/\\1/p")
+            if [ -n "$SUBMENU" ] && [ -n "$ENTRY" ]; then EXPECT="${SUBMENU}>${ENTRY}"; else EXPECT="${ENTRY}"; fi
+        else
+            ENTRY=""
+            EXPECT_ID=$(grubby --info="/boot/vmlinuz-${_K}" 2>/dev/null | sed -n 's/^id=//p' | head -1 | tr -d '"')
+            EXPECT_INDEX=$(grubby --info="/boot/vmlinuz-${_K}" 2>/dev/null | sed -n 's/^index=//p' | head -1)
+            EXPECT="${EXPECT_ID:-${EXPECT_INDEX}}"
+        fi
+        echo "Expected selection for ${_K}: ${EXPECT:-<none found>}"
+
         if [ "${_ONE_TIME}" = 1 ]; then
             if [ "${_M}" = grub_debian ]; then
                 NEXT=$(grub-editenv list 2>/dev/null | sed -n 's/^next_entry=//p' | head -1)
@@ -2300,8 +2387,12 @@ def verifyBootSelection(String kernelRelease) {
                 NEXT=$(grub2-editenv list 2>/dev/null | sed -n 's/^next_entry=//p' | head -1)
             fi
             if [ -n "${NEXT}" ]; then
-                echo "OK: one-time boot armed for the next reboot (next_entry=${NEXT})."
-                exit 0
+                if [ -n "${EXPECT}" ] && [ "${NEXT}" = "${EXPECT}" ]; then
+                    echo "OK: one-time boot armed for ${_K} on the next reboot (next_entry=${NEXT})."
+                    exit 0
+                fi
+                echo "ERROR: next_entry '${NEXT}' is not the entry for ${_K} ('${EXPECT:-<none found>}')." >&2
+                exit 1
             fi
             echo "NOTE: one-time boot fell back to the persistent default; verifying that instead."
         fi
@@ -2310,14 +2401,14 @@ def verifyBootSelection(String kernelRelease) {
             echo "saved_entry = ${SAVED:-<unset>}"
             case "${SAVED}" in
                 "") echo "ERROR: no saved_entry recorded; the SUT would boot its old default." >&2; exit 1 ;;
-                *"${_K}"*) echo "OK: the saved default selects ${_K}." ;;
-                *) echo "ERROR: saved_entry '${SAVED}' does not name ${_K}." >&2; exit 1 ;;
+                "${EXPECT}"|"${ENTRY}") echo "OK: the saved default selects ${_K}." ;;
+                *) echo "ERROR: saved_entry '${SAVED}' is not the entry for ${_K} ('${EXPECT:-<none found>}')." >&2; exit 1 ;;
             esac
         else
             DEF=$(grubby --default-kernel 2>/dev/null || true)
             echo "grubby --default-kernel = ${DEF:-<none>}"
-            case "${DEF}" in
-                *"vmlinuz-${_K}"*) echo "OK: the default kernel is ${_K}." ;;
+            case "${DEF##*/}" in
+                "vmlinuz-${_K}"|"vmlinuz-${_K}.efi") echo "OK: the default kernel is ${_K}." ;;
                 *) echo "ERROR: default kernel is '${DEF}', expected /boot/vmlinuz-${_K}." >&2; exit 1 ;;
             esac
         fi
@@ -2510,9 +2601,13 @@ def rebootAndWaitForNode(String message) {
     } catch (Throwable t) {
         echo "Agent disconnected for reboot (expected): ${t.message?.take(120)}"
     }
-    echo "Waiting up to 15 min for agent ${params.NODE_LABEL} after reboot..."
+    // 1 hour, not minutes: on veLinux a kernel change can give the SUT a new IP, and the
+    // agent only reconnects after someone updates the node's host IP and relaunches it.
+    echo "Waiting up to 1 hour for agent ${params.NODE_LABEL} after reboot..."
+    echo "If the SUT came back with a new IP (seen on veLinux after a kernel change), update the node's host IP " +
+        "(Manage Jenkins > Nodes > the node with label '${params.NODE_LABEL}' > Configure) and relaunch the agent; the build continues once it is online."
     sleep 60
-    timeout(time: 15, unit: 'MINUTES') {
+    timeout(time: 60, unit: 'MINUTES') {
         waitUntil {
             def ok = false
             try {
@@ -2520,6 +2615,9 @@ def rebootAndWaitForNode(String message) {
                     sh 'set -eu; echo agent is back online'
                     ok = true
                 }
+            } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+                // User abort or the 1-hour timeout: must propagate, or waitUntil re-queues forever.
+                throw e
             } catch (Throwable t) {
                 echo "Still waiting: ${t.message?.take(120)}"
             }
@@ -3067,7 +3165,8 @@ def Lkp_test(String lkpReportContext = 'host') {
         "_HACK_ITER=${params.HACKBENCH_ITERATIONS}",
         "_EBIZZY_ITER=${params.EBIZZY_ITERATIONS}",
         "_RUN_UNIXBENCH=${runsUnixbench() ? '1' : '0'}",
-        "_OUT_DIR=/home/amd"
+        "_OUT_DIR=/home/amd",
+        "_RUN_DIR=${env.RUN_BACKUP_DIR ?: ''}"
     ]) {
         sh '''
         set -eu
@@ -3251,12 +3350,23 @@ shutil.move(tmp, xlsx)
 print("Wrote %d cell(s) to %s" % (len(writes), xlsx))
 PY
 
-        XLSX="${XLSX}" COL="${_COL}" OS_FULL="${OS_FULL}" KMAJMIN="${KMAJMIN}" PIPE="${_PIPE}" \
+        XLSX="${XLSX}" COL="${_COL:-}" OS_FULL="${OS_FULL}" KMAJMIN="${KMAJMIN}" PIPE="${_PIPE}" \
         HOSTNAME_S="${HOSTNAME_S}" MODEL="${MODEL}" CPUFAM="${CPUFAM}" SOCKETS="${SOCKETS}" \
         CORES="${CORES}" NODES="${NODES}" HACK_ITER="${_HACK_ITER}" EBIZZY_ITER="${_EBIZZY_ITER}" \
         RUN_UNIXBENCH="${_RUN_UNIXBENCH}" python3 "${PYTOOL}"
         rm -f "${PYTOOL}"
         echo "LKP results written to ${XLSX} (column ${_COL:-none})"
+
+        # Copy the just-updated workbook into Run_<N>/ (download from the Jenkins Workspace
+        # page), overwriting the previous copy, so it matches the /home/amd workbook.
+        _RUN_DIR="${_RUN_DIR:-}"
+        if [ -n "${_RUN_DIR}" ]; then
+            mkdir -p "${_RUN_DIR}"
+            cp -f "${XLSX}" "${_RUN_DIR}/"
+            echo "Workbook copied for Jenkins download: ${_RUN_DIR}/$(basename "${XLSX}")"
+        else
+            echo "RUN_BACKUP_DIR is not set; workbook not copied to the workspace." >&2
+        fi
         '''
     }
 
