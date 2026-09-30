@@ -8,6 +8,12 @@ The pipeline already auto-installs the kernel build toolchain, `python3-pip`,
 `python3-pyfiglet`/`openpyxl` (or pip `pyfiglet`), `sshpass`, and clones+builds LKP
 (`hackbench`/`ebizzy`). Everything in the prompt below is the remaining, host-level setup.
 
+The same host setup also covers `lkp_6os.groovy` and `lkp_vmcount.groovy`; they only skip the
+kernel install inside the guest.
+
+Once the host passes, tick **`PREREQUISITES_CONFIRMED`** when you start a build: the build fails
+in "Validate parameters" if it is left unticked.
+
 ---
 
 ## How to use
@@ -81,7 +87,8 @@ Connect over SSH. Prefer `root` for installs. Use `amd` only to verify the *agen
 7. **Internet reachability** from the host: `github.com` (LKP clone), the distro repos, and
    `pypi.org` (for pip pyfiglet). Report if a proxy is likely needed.
 8. **Disk space:** `/vms`, `/tests`, and `/home/amd` each have room (goldens are ~20 GB each;
-   overlays and result archives accumulate).
+   overlays accumulate on `/vms`; LKP results and workbook copies accumulate in the Jenkins job
+   workspaces on `/tests`).
 
 ### Step 4 — FILE / PATH CHECKS (notify the user; do NOT fabricate anything)
 **Do NOT create any directory in this step.** `/vms` and `/tests` are separate hardware disks
@@ -112,10 +119,13 @@ user to mount or create it. Never run `mkdir` under `/vms` or `/tests`.
    ```
    scp amd@10.86.26.102:/home/amd/vol1/images/jenkins_excel_template/lkp_result_template.xlsx  /vms/jenkins_excel_template/
    ```
-3. **Result-archive root** **`/tests/jenkins/workspace/`** must exist and be writable
-   (per-build subdirs are created by the pipeline). Do not create it: if it is missing, notify
-   the user that the directory is not present (check that `/tests` is mounted). If it exists,
-   confirm it is writable (for example `test -w /tests/jenkins/workspace`).
+3. **Jenkins agent workspace** **`/tests/jenkins/workspace/`** (the agent's remote root
+   directory) must exist, be writable and have enough space. The pipeline saves the LKP results
+   and a copy of the Excel workbook in the job workspace under it
+   (`<job workspace>/Run_<BUILD_NUMBER>/`), where they can be downloaded from the build's
+   Workspace page. Do not create it: if it is missing, notify the user that the directory is not
+   present (check that `/tests` is mounted). If it exists, confirm it is writable (for example
+   `test -w /tests/jenkins/workspace`) and report `df -h /tests`.
 4. **Kernel source (only if `RPM_KERNEL_BUILD=BUILD_BOTH` will be used):** the `EXISTING_REPO_PATH`
    git checkout must exist on the agent on the intended branch — ask the user for the path and
    verify it is a git working tree.
@@ -183,6 +193,15 @@ actions the user still has to take (especially any missing qcow2 images and the 
 Do not mark the host "ready" unless every Step 2–5 item is OK. The Step 5 SSH login may be
 CANNOT-VERIFY if no guest credentials were given.
 
+End the report with these reminders for the user:
+- The Jenkins agent for this host must be **online** before a build starts: the pipeline fails
+  after 1 minute if no online agent has the `NODE_LABEL` label.
+- After each kernel reboot the pipeline waits **up to 1 hour** for the agent to reconnect. On
+  veLinux the host can come back with a **new IP** after a kernel change: update the node's host
+  IP in Jenkins (Manage Jenkins > Nodes > the node > Configure) and relaunch the agent within
+  that hour, and the build continues.
+- Tick **`PREREQUISITES_CONFIRMED`** when starting the build.
+
 ---
 
 ## Quick manual checklist (if you are doing it by hand instead of via the agent)
@@ -196,7 +215,8 @@ CANNOT-VERIFY if no guest credentials were given.
 | 12 goldens | `ls /vms/jenkins_qcow2/` → scp from `10.86.26.102` + `chown qemu:qemu` if missing |
 | Excel template | `ls /vms/jenkins_excel_template/lkp_result_template.xlsx` → scp if missing |
 | disk mounts | `findmnt /vms` and `findmnt /tests` (hardware disks; mount them if missing, never `mkdir`) |
-| result root | `ls -d /tests/jenkins/workspace` (must exist and be writable; notify if missing) |
+| agent workspace | `ls -d /tests/jenkins/workspace` (agent root; must exist, be writable and have space: results + workbook copies are saved in the job workspace under `Run_<BUILD_NUMBER>/`) |
 | test VM | overlay on the host-OS golden + `virt-install --import` -> `running`, DHCP IP, SSH login; then destroy/undefine + delete overlay |
-| Jenkins agent | runs as **root**, Java 21, auto-reconnects after reboot |
+| Jenkins agent | runs as **root**, Java 21, online before the build (fails after 1 min otherwise), reconnects within 1 hour after a reboot (veLinux: update the node IP and relaunch if it changed) |
 | credential | `VM_LOGIN_CREDENTIALS_ID` set to a Jenkins username/password credential |
+| build parameter | tick `PREREQUISITES_CONFIRMED` (the build fails if it is unticked) |
